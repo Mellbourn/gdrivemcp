@@ -32,6 +32,18 @@ server.registerTool(
 const auth = await getAuthenticatedClient();
 const drive = google.drive({ version: "v3", auth });
 
+function formatFiles(files: any[]): string {
+  return files
+    .map((f) => {
+      const name = f.name ?? "(unnamed)";
+      const type = f.mimeType ?? "";
+      const modified = f.modifiedTime ?? "";
+      const link = f.webViewLink ?? "";
+      return `${name}\n  ID: ${f.id}\n  Type: ${type}\n  Modified: ${modified}\n  Link: ${link}`;
+    })
+    .join("\n\n");
+}
+
 server.registerTool(
   "drive_search",
   {
@@ -41,13 +53,18 @@ server.registerTool(
         .string()
         .describe("Google Drive query, e.g. \"name contains 'report'\""),
       maxResults: z.number().optional().default(10),
+      pageToken: z
+        .string()
+        .optional()
+        .describe("Token from previous search to get next page"),
     },
   },
-  async ({ query, maxResults }) => {
+  async ({ query, maxResults, pageToken }) => {
     const res = await drive.files.list({
       q: query,
       pageSize: maxResults,
-      fields: "files(id,name,mimeType,modifiedTime,webViewLink)",
+      pageToken: pageToken,
+      fields: "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink)",
     });
     const files = res.data.files ?? [];
     if (files.length === 0) {
@@ -55,16 +72,83 @@ server.registerTool(
         content: [{ type: "text", text: "No files found." }],
       };
     }
-    const lines = files.map((f) => {
-      const name = f.name ?? "(unnamed)";
-      const type = f.mimeType ?? "";
-      const modified = f.modifiedTime ?? "";
-      const link = f.webViewLink ?? "";
-      return `${name}\n  ID: ${f.id}\n  Type: ${type}\n  Modified: ${modified}\n  Link: ${link}`;
+    let text = formatFiles(files);
+    if (res.data.nextPageToken) {
+      text += `\n\nNext page token: ${res.data.nextPageToken}`;
+    }
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+server.registerTool(
+  "drive_list_folder",
+  {
+    description: "List files in a Google Drive folder",
+    inputSchema: {
+      folderId: z.string().optional().default("root"),
+      maxResults: z.number().optional().default(20),
+      pageToken: z.string().optional(),
+    },
+  },
+  async ({ folderId, maxResults, pageToken }) => {
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      pageSize: maxResults,
+      pageToken: pageToken,
+      fields: "nextPageToken,files(id,name,mimeType,modifiedTime,webViewLink)",
     });
-    return {
-      content: [{ type: "text", text: lines.join("\n\n") }],
-    };
+    const files = res.data.files ?? [];
+    if (files.length === 0) {
+      return { content: [{ type: "text", text: "No files found." }] };
+    }
+    let text = formatFiles(files);
+    if (res.data.nextPageToken) {
+      text += `\n\nNext page token: ${res.data.nextPageToken}`;
+    }
+    return { content: [{ type: "text", text }] };
+  }
+);
+
+const GOOGLE_MIME_EXPORT: Record<string, string> = {
+  "application/vnd.google-apps.document": "text/plain",
+  "application/vnd.google-apps.spreadsheet": "text/csv",
+  "application/vnd.google-apps.presentation": "text/plain",
+};
+
+server.registerTool(
+  "drive_read_file",
+  {
+    description: "Read the text content of a Google Drive file by ID",
+    inputSchema: {
+      fileId: z.string(),
+    },
+  },
+  async ({ fileId }) => {
+    const meta = await drive.files.get({ fileId, fields: "name,mimeType" });
+    const mimeType = meta.data.mimeType ?? "";
+
+    if (GOOGLE_MIME_EXPORT[mimeType]) {
+      const res = await drive.files.export(
+        { fileId, mimeType: GOOGLE_MIME_EXPORT[mimeType] },
+        { responseType: "text" }
+      );
+      return { content: [{ type: "text", text: res.data as string }] };
+    } else if (mimeType.startsWith("text/") || mimeType === "application/json") {
+      const res = await drive.files.get(
+        { fileId, alt: "media" },
+        { responseType: "text" }
+      );
+      return { content: [{ type: "text", text: res.data as string }] };
+    } else {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Cannot read binary file (${mimeType}). Use drive_search to find text files.`,
+          },
+        ],
+      };
+    }
   }
 );
 
